@@ -239,6 +239,16 @@ function resolveHttpProxyTarget(
   return new URL(`${parsedRequestUrl.pathname}${parsedRequestUrl.search}`, origin);
 }
 
+function isPrivateLanHost(hostname: string): boolean {
+  const parts = hostname.split('.');
+  if (parts.length !== 4) return false;
+  if (!parts.every((p) => /^\d+$/.test(p))) return false;
+  const octets = parts.map(Number);
+  if (!octets.every((n) => Number.isInteger(n) && n >= 0 && n <= 255)) return false;
+  const [a, b] = octets;
+  return a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 169 && b === 254);
+}
+
 export function normalizeDaemonProxyOriginHeader(options: {
   daemonOrigin: string;
   origin: string | undefined;
@@ -252,7 +262,20 @@ export function normalizeDaemonProxyOriginHeader(options: {
     schemes.flatMap((scheme) => loopbackHosts.map((host) => `${scheme}://${host}:${options.webPort}`)),
   );
 
-  return allowedWebOrigins.has(options.origin) ? options.daemonOrigin : options.origin;
+  if (allowedWebOrigins.has(options.origin)) return options.daemonOrigin;
+
+  // Private LAN IPs on the web port are also trusted (e.g. http://192.168.x.x:<webPort>).
+  let parsed: URL;
+  try {
+    parsed = new URL(options.origin);
+  } catch {
+    return options.origin;
+  }
+  if (isPrivateLanHost(parsed.hostname) && (parsed.port || '80') === String(options.webPort)) {
+    return options.daemonOrigin;
+  }
+
+  return options.origin;
 }
 
 async function proxyHttpRequest(

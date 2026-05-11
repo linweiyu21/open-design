@@ -43,7 +43,8 @@ function resolveDevTsconfigPath() {
 const DEV_TSCONFIG_PATH = resolveDevTsconfigPath();
 
 const nextConfig: NextConfig = {
-  allowedDevOrigins: ['127.0.0.1'],
+  allowedDevOrigins: ['127.0.0.1', '192.168.3.83'],
+  // Note: '192.168.3.83' is the LAN IP for MacBook access.
   outputFileTracingRoot: WORKSPACE_ROOT,
   reactStrictMode: true,
   turbopack: {
