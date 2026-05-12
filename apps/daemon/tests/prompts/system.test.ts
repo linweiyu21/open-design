@@ -9,8 +9,14 @@ import { composeSystemPrompt } from '../../src/prompts/system.js';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const repoRoot = path.resolve(__dirname, '../../../..');
-const liveArtifactRoot = path.join(repoRoot, 'skills/live-artifact');
-const liveArtifactSkillPath = path.join(repoRoot, 'skills/live-artifact/SKILL.md');
+// `live-artifact` moved from skills/ to design-templates/ in PR #955 as
+// part of the skills/design-templates split (see specs/current/
+// skills-and-design-templates.md). The root path now points there.
+const liveArtifactRoot = path.join(repoRoot, 'design-templates/live-artifact');
+const liveArtifactSkillPath = path.join(
+  repoRoot,
+  'design-templates/live-artifact/SKILL.md',
+);
 const liveArtifactSkillMarkdown = readFileSync(liveArtifactSkillPath, 'utf8');
 const liveArtifactSkillBody = [
   `> **Skill root (absolute):** \`${liveArtifactRoot}\``,
@@ -25,8 +31,13 @@ const liveArtifactSkillBody = [
   liveArtifactSkillMarkdown.replace(/^---[\s\S]*?---\n\n/, '').trim(),
 ].join('\n');
 
-const hyperframesRoot = path.join(repoRoot, 'skills/hyperframes');
-const hyperframesSkillPath = path.join(repoRoot, 'skills/hyperframes/SKILL.md');
+// `hyperframes` also moved to design-templates/ in PR #955 — same split
+// as `live-artifact` above.
+const hyperframesRoot = path.join(repoRoot, 'design-templates/hyperframes');
+const hyperframesSkillPath = path.join(
+  repoRoot,
+  'design-templates/hyperframes/SKILL.md',
+);
 const hyperframesSkillMarkdown = readFileSync(hyperframesSkillPath, 'utf8');
 const hyperframesSkillBody = [
   `> **Skill root (absolute):** \`${hyperframesRoot}\``,
@@ -87,6 +98,19 @@ describe('composeSystemPrompt', () => {
     expect(prompt).toContain('## Active skill — hyperframes');
     expect(prompt).toContain('**Pre-flight (do this before any other tool):**');
     expect(prompt).toContain('`references/html-in-canvas.md`');
+  });
+
+  it('does not add the responsive web contract to deck metadata without platform fields', () => {
+    const prompt = composeSystemPrompt({
+      metadata: {
+        kind: 'deck',
+        speakerNotes: true,
+      } as any,
+    });
+
+    expect(prompt).toContain('- **kind**: deck');
+    expect(prompt).not.toContain('**responsive web contract**');
+    expect(prompt).not.toContain('**platformTargets**');
   });
 
   describe('artifact handoff no-emit clauses (#1143)', () => {

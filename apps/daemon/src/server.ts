@@ -61,6 +61,7 @@ import {
 import { attachAcpSession } from './acp.js';
 import { attachPiRpcSession } from './pi-rpc.js';
 import { createClaudeStreamHandler } from './claude-stream.js';
+import { diagnoseClaudeCliFailure } from './claude-diagnostics.js';
 import { loadCritiqueConfigFromEnv } from './critique/config.js';
 import { reconcileStaleRuns } from './critique/persistence.js';
 import { runOrchestrator } from './critique/orchestrator.js';
@@ -881,6 +882,15 @@ const DESIGN_SYSTEMS_DIR = resolveDaemonResourceDir(
   'design-systems',
   path.join(PROJECT_ROOT, 'design-systems'),
 );
+// Renderable templates pulled out of `skills/` by the skills/design-templates
+// split (PR #955) so the EntryView Templates tab gets the large rendering
+// catalogue and Settings → Skills only carries functional skills the agent
+// invokes mid-task. See specs/current/skills-and-design-templates.md.
+const DESIGN_TEMPLATES_DIR = resolveDaemonResourceDir(
+  DAEMON_RESOURCE_ROOT,
+  'design-templates',
+  path.join(PROJECT_ROOT, 'design-templates'),
+);
 const CRAFT_DIR = resolveDaemonResourceDir(
   DAEMON_RESOURCE_ROOT,
   'craft',
@@ -975,8 +985,26 @@ const CRITIQUE_ARTIFACTS_DIR = path.join(RUNTIME_DATA_DIR, 'critique-artifacts')
 const PROJECTS_DIR = path.join(RUNTIME_DATA_DIR, 'projects');
 const USER_SKILLS_DIR = path.join(RUNTIME_DATA_DIR, 'skills');
 const USER_DESIGN_SYSTEMS_DIR = path.join(RUNTIME_DATA_DIR, 'design-systems');
+// User-imported design templates mirror USER_SKILLS_DIR but are scanned
+// against DESIGN_TEMPLATES_DIR rather than SKILLS_DIR so the EntryView
+// Templates surface and the Settings → Skills surface stay decoupled.
+const USER_DESIGN_TEMPLATES_DIR = path.join(RUNTIME_DATA_DIR, 'design-templates');
+// Multi-root tuples used everywhere the daemon resolves a skill / template
+// id without knowing which surface it came from. SKILL_ROOTS drives
+// Settings → Skills; DESIGN_TEMPLATE_ROOTS drives the EntryView Templates
+// gallery; ALL_SKILL_LIKE_ROOTS spans both for chat run system-prompt
+// composition and the orbit template resolver, where stored project ids
+// can resolve to either root after the split.
+const SKILL_ROOTS = [USER_SKILLS_DIR, SKILLS_DIR];
+const DESIGN_TEMPLATE_ROOTS = [USER_DESIGN_TEMPLATES_DIR, DESIGN_TEMPLATES_DIR];
+const ALL_SKILL_LIKE_ROOTS = [
+  USER_SKILLS_DIR,
+  USER_DESIGN_TEMPLATES_DIR,
+  SKILLS_DIR,
+  DESIGN_TEMPLATES_DIR,
+];
 fs.mkdirSync(PROJECTS_DIR, { recursive: true });
-for (const dir of [USER_SKILLS_DIR, USER_DESIGN_SYSTEMS_DIR]) {
+for (const dir of [USER_SKILLS_DIR, USER_DESIGN_SYSTEMS_DIR, USER_DESIGN_TEMPLATES_DIR]) {
   fs.mkdirSync(dir, { recursive: true });
 }
 fs.mkdirSync(CRITIQUE_ARTIFACTS_DIR, { recursive: true });
@@ -2044,24 +2072,26 @@ export async function startServer({
   const app = express();
   app.use(express.json({ limit: '4mb' }));
 
-  // Multi-directory scanning: merge built-in and user-installed skills/DS.
-  // Built-in items win on ID collisions (higher priority per skills-protocol.md).
+  // Multi-directory scanning shared by every skill / template surface. The
+  // helpers delegate to listSkills(roots) which walks roots in priority
+  // order, tags each entry with the SkillSource ('user' for the user
+  // root, 'built-in' for the bundled root) the contracts package
+  // declares, and lets a user-imported entry shadow a built-in one of
+  // the same id without erasing the built-in copy.
   async function listAllSkills() {
-    const builtIn = (await listSkills(SKILLS_DIR)).map((s) => ({
-      ...s,
-      source: 'built-in',
-    }));
-    let installed = [];
-    try {
-      installed = (await listSkills(USER_SKILLS_DIR)).map((s) => ({
-        ...s,
-        source: 'installed',
-      }));
-    } catch {
-      // User directory may not exist yet or be unreadable.
-    }
-    const seen = new Set(builtIn.map((s) => s.id));
-    return [...builtIn, ...installed.filter((s) => !seen.has(s.id))];
+    return listSkills(SKILL_ROOTS);
+  }
+
+  async function listAllDesignTemplates() {
+    return listSkills(DESIGN_TEMPLATE_ROOTS);
+  }
+
+  // Spans both roots so chat run system-prompt composition and the orbit
+  // template resolver can resolve a stored project.skillId regardless of
+  // which surface created the project after the skills/design-templates
+  // split. Keep in sync with SKILL_ROOTS + DESIGN_TEMPLATE_ROOTS above.
+  async function listAllSkillLikeEntries() {
+    return listSkills(ALL_SKILL_LIKE_ROOTS);
   }
 
   async function listAllDesignSystems() {
@@ -2593,6 +2623,8 @@ export async function startServer({
     RUNTIME_DATA_DIR_CANONICAL,
     DESIGN_SYSTEMS_DIR,
     USER_DESIGN_SYSTEMS_DIR,
+    DESIGN_TEMPLATES_DIR,
+    USER_DESIGN_TEMPLATES_DIR,
     SKILLS_DIR,
     USER_SKILLS_DIR,
     PROMPT_TEMPLATES_DIR,
@@ -2802,7 +2834,13 @@ export async function startServer({
   registerStaticResourceRoutes(app, {
     http: httpDeps,
     paths: pathDeps,
-    resources: { listAllSkills, listAllDesignSystems, mimeFor },
+    resources: {
+      listAllSkills,
+      listAllDesignTemplates,
+      listAllSkillLikeEntries,
+      listAllDesignSystems,
+      mimeFor,
+    },
   });
   registerProjectArtifactRoutes(app, {
     http: httpDeps,
@@ -2899,8 +2937,11 @@ export async function startServer({
     let skillCraftRequires = [];
     let activeSkillDir = null;
     if (effectiveSkillId) {
+      // Span both functional skills and design templates so a project
+      // saved against either surface keeps its system prompt after the
+      // skills/design-templates split. See specs/current/skills-and-design-templates.md.
       const skill = findSkillById(
-        await listAllSkills(),
+        await listAllSkillLikeEntries(),
         effectiveSkillId,
       );
       if (skill) {
@@ -3571,6 +3612,26 @@ export async function startServer({
     const inactivityTimeoutMs = resolveChatRunInactivityTimeoutMs();
     const inactivityKillGraceMs = 3_000;
     let inactivityTimer = null;
+    let childStdoutSeen = false;
+    let lastAgentEventPhase = 'spawn pending';
+    let lastToolResultChars = 0;
+    const summarizeAgentEventForInactivity = (payload) => {
+      const type = payload?.type ? String(payload.type) : 'unknown';
+      if (type === 'tool_result') {
+        const content = typeof payload.content === 'string' ? payload.content : '';
+        lastToolResultChars = Math.max(lastToolResultChars, content.length);
+        return `tool_result:${content.length} chars`;
+      }
+      if (type === 'tool_use') {
+        const name = payload?.name ? String(payload.name) : 'unknown';
+        return `tool_use:${name}`;
+      }
+      if (type === 'text_delta' || type === 'thinking_delta') {
+        const text = typeof payload.text === 'string' ? payload.text : '';
+        return `${type}:${text.length} chars`;
+      }
+      return type;
+    };
     const clearInactivityWatchdog = () => {
       if (inactivityTimer) {
         clearTimeout(inactivityTimer);
@@ -3590,7 +3651,10 @@ export async function startServer({
       if (run.cancelRequested || design.runs.isTerminal(run.status)) return;
       const message =
         `Agent stalled without emitting any new output for ${Math.round(inactivityTimeoutMs / 1000)}s. ` +
-        'The model or CLI likely hung while generating. Retry the turn or pick a different model.';
+        'The model or CLI likely hung while generating. ' +
+        `Phase details: spawned agent binary ${resolvedBin}; stdout arrived: ${childStdoutSeen ? 'yes' : 'no'}; ` +
+        `last agent event: ${lastAgentEventPhase}; largest tool result observed: ${lastToolResultChars} chars. ` +
+        'Retry the turn, pick a different model, or start a new conversation if the prior context is very large.';
       clearInactivityWatchdog();
       send('error', createSseErrorPayload('AGENT_EXECUTION_FAILED', message, { retryable: true }));
       design.runs.finish(run, 'failed', 1, null);
@@ -3610,9 +3674,11 @@ export async function startServer({
       activeChatAgentEventSinks.delete(toolTokenGrant?.runId ?? runId);
     };
     if (toolTokenGrant?.runId) {
-      activeChatAgentEventSinks.set(toolTokenGrant.runId, (payload) =>
-        (noteAgentActivity(), send('agent', payload)),
-      );
+      activeChatAgentEventSinks.set(toolTokenGrant.runId, (payload) => {
+        lastAgentEventPhase = summarizeAgentEventForInactivity(payload);
+        noteAgentActivity();
+        send('agent', payload);
+      });
     }
     // If detection can't find the binary, surface a friendly SSE error
     // pointing at /api/agents instead of silently falling back to
@@ -3664,6 +3730,9 @@ export async function startServer({
     let child;
     let acpSession = null;
     let writePromptToChildStdin = false;
+    let spawnedAgentEnv = null;
+    let agentStdoutTail = '';
+    let agentStderrTail = '';
     try {
       // Prompt delivery via stdin is now the universal default. This bypasses
       // both the cmd.exe 8KB limit and the CreateProcess 32KB limit.
@@ -3682,6 +3751,7 @@ export async function startServer({
         ),
         ...odMediaEnv,
       };
+      spawnedAgentEnv = env;
       const invocation = createCommandInvocation({
         command: resolvedBin,
         args,
@@ -3731,7 +3801,13 @@ export async function startServer({
     // structured adapters that buffer partial lines (Codex item.completed,
     // pi-rpc session/prompt, ACP agent messages) and models that spend a
     // long time in non-streamed reasoning still keep the run alive.
-    child.stdout.on('data', () => noteAgentActivity());
+    child.stdout.on('data', (chunk) => {
+      childStdoutSeen = true;
+      noteAgentActivity();
+      if (def.id === 'claude') {
+        agentStdoutTail = `${agentStdoutTail}${chunk}`.slice(-1000);
+      }
+    });
 
     // ---- Memory: assistant-reply buffer for LLM extraction --------------
     // Capture up to 32 KiB of raw stdout. The LLM extractor (fired in the
@@ -3921,6 +3997,7 @@ export async function startServer({
         }));
         return;
       }
+      lastAgentEventPhase = summarizeAgentEventForInactivity(ev);
       noteAgentActivity();
       if (ev?.type && SUBSTANTIVE_AGENT_EVENT_TYPES.has(ev.type)) {
         agentProducedOutput = true;
@@ -3930,6 +4007,7 @@ export async function startServer({
 
     if (def.streamFormat === 'claude-stream-json') {
       const claude = createClaudeStreamHandler((ev) => {
+        lastAgentEventPhase = summarizeAgentEventForInactivity(ev);
         noteAgentActivity();
         send('agent', ev);
       });
@@ -3942,6 +4020,7 @@ export async function startServer({
       child.on('close', () => qoder.flush());
     } else if (def.streamFormat === 'copilot-stream-json') {
       const copilot = createCopilotStreamHandler((ev) => {
+        lastAgentEventPhase = summarizeAgentEventForInactivity(ev);
         noteAgentActivity();
         send('agent', ev);
       });
@@ -4025,6 +4104,9 @@ export async function startServer({
     run.acpSession = acpSession;
     child.stderr.on('data', (chunk) => {
       noteAgentActivity();
+      if (def.id === 'claude') {
+        agentStderrTail = `${agentStderrTail}${chunk}`.slice(-1000);
+      }
       send('stderr', { chunk });
     });
 
@@ -4072,6 +4154,23 @@ export async function startServer({
         : code === 0
           ? 'succeeded'
           : 'failed';
+      if (status === 'failed') {
+        const diagnostic = diagnoseClaudeCliFailure({
+          agentId: def.id,
+          exitCode: code,
+          signal,
+          stderrTail: agentStderrTail,
+          stdoutTail: agentStdoutTail,
+          env: spawnedAgentEnv,
+        });
+        if (diagnostic) {
+          send('error', createSseErrorPayload(
+            'AGENT_EXECUTION_FAILED',
+            diagnostic.message,
+            { retryable: diagnostic.retryable, details: { detail: diagnostic.detail } },
+          ));
+        }
+      }
       design.runs.finish(run, status, code, signal);
     });
     if (writePromptToChildStdin && child.stdin) {
@@ -4215,7 +4314,11 @@ export async function startServer({
   });
 
   orbitService.setTemplateResolver(async (skillId) => {
-    const skills = await listAllSkills();
+    // Orbit templates (live-artifact, etc.) live under design-templates after
+    // the split, but earlier projects may still point at functional-skill
+    // ids for the same purpose — search both roots so a stored project id
+    // keeps resolving through one or the other.
+    const skills = await listAllSkillLikeEntries();
     const skill = findSkillById(skills, skillId);
     if (!skill || skill.scenario !== 'orbit') return null;
     return {
@@ -4361,7 +4464,13 @@ export async function startServer({
     nativeDialogs: nativeDialogDeps,
     research: researchDeps,
     mcp: { pendingAuth: mcpPendingAuth, daemonUrlRef },
-    resources: { listAllSkills, listAllDesignSystems, mimeFor },
+    resources: {
+      listAllSkills,
+      listAllDesignTemplates,
+      listAllSkillLikeEntries,
+      listAllDesignSystems,
+      mimeFor,
+    },
     routines: { routineService },
     validation: validationDeps,
     finalize: finalizeDeps,

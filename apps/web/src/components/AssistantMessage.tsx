@@ -6,8 +6,10 @@ import {
   splitOnQuestionForms,
   type QuestionForm,
 } from "../artifacts/question-form";
+import { stripArtifact } from "../artifacts/strip";
 import { QuestionFormView, parseSubmittedAnswers } from "./QuestionForm";
 import { Icon } from "./Icon";
+import { MessageFeedback } from "./MessageFeedback";
 import { useT } from "../i18n";
 import { unfinishedTodosFromEvents, type TodoItem } from "../runtime/todos";
 import type { Dict } from "../i18n/types";
@@ -72,6 +74,9 @@ export function AssistantMessage({
     | undefined;
   const produced = message.producedFiles ?? [];
   const roleLabel = assistantRoleLabel(message, t);
+  const hasEmptyResponse = events.some(
+    (e) => e.kind === "status" && e.label === "empty_response"
+  );
   const unfinishedTodos = streaming ? [] : unfinishedTodosFromEvents(events);
   const runSucceeded =
     !streaming &&
@@ -158,7 +163,17 @@ export function AssistantMessage({
           endedAt={message.endedAt}
           usage={usage}
           hasUnfinishedTodos={unfinishedTodos.length > 0}
+          hasEmptyResponse={hasEmptyResponse}
         />
+        {/* Feedback widget for issue #1288 — gated on `produced.length > 0`
+            because the issue scopes feedback to turns that produce a final
+            artifact, not text-only acknowledgements or question-form turns
+            (lefarcen review on PR #1308). The `runSucceeded`
+            guard keeps it off failed runs, and `!hasEmptyResponse` keeps it
+            off agents that succeeded silently with no content. */}
+        {runSucceeded && !hasEmptyResponse && produced.length > 0 ? (
+          <MessageFeedback messageId={message.id} />
+        ) : null}
       </div>
     </div>
   );
@@ -223,16 +238,18 @@ function AssistantFooter({
   endedAt,
   usage,
   hasUnfinishedTodos,
+  hasEmptyResponse,
 }: {
   streaming: boolean;
   startedAt: number | undefined;
   endedAt: number | undefined;
   usage: Extract<AgentEvent, { kind: "usage" }> | undefined;
   hasUnfinishedTodos: boolean;
+  hasEmptyResponse: boolean;
 }) {
   const t = useT();
   const elapsed = useLiveElapsed(streaming, startedAt, endedAt);
-  if (!streaming && !elapsed && !usage && !hasUnfinishedTodos) return null;
+  if (!streaming && !elapsed && !usage && !hasUnfinishedTodos && !hasEmptyResponse) return null;
   return (
     <div
       className="assistant-footer"
@@ -242,6 +259,8 @@ function AssistantFooter({
       <span className="assistant-label">
         {streaming
           ? t("assistant.workingLabel")
+          : hasEmptyResponse
+          ? t("assistant.emptyResponseLabel")
           : hasUnfinishedTodos
           ? t("assistant.unfinishedLabel")
           : t("assistant.doneLabel")}
@@ -822,7 +841,8 @@ function buildBlocks(events: AgentEvent[]): Block[] {
         ev.label === "streaming" ||
         ev.label === "starting" ||
         ev.label === "requesting" ||
-        ev.label === "thinking"
+        ev.label === "thinking" ||
+        ev.label === "empty_response"
       )
         continue;
       const last = out[out.length - 1];
@@ -832,17 +852,6 @@ function buildBlocks(events: AgentEvent[]): Block[] {
     }
   }
   return out;
-}
-
-function stripArtifact(content: string): string {
-  const open = content.indexOf("<artifact");
-  if (open === -1) return content;
-  const closeTag = content.indexOf(">", open);
-  const end = content.indexOf("</artifact>", closeTag);
-  return (
-    content.slice(0, open) +
-    content.slice(end === -1 ? content.length : end + 11)
-  ).trim();
 }
 
 // Split prose into alternating plain-text and `<system-reminder>` segments.
